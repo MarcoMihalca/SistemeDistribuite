@@ -1,0 +1,19 @@
+# Directoare de build Maven și IDE
+target/
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# Directoarele de stocare locală ale nodurilor
+data/
+
+# Fișiere temporare sau rezultate din teste
+out/
+*.log
+.DS_Store
+Thumbs.db
+SD_Proiect_Etapa1.pdf
+
