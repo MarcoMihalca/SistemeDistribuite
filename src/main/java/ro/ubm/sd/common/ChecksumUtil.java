@@ -6,7 +6,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.HexFormat;
 
 /**
  * Calculul checksum-ului SHA-256 al fisierelor, verificarea de integritate.
@@ -26,7 +25,7 @@ public final class ChecksumUtil {
             while ((bytesRead = in.read(buffer)) != -1) {
                 digest.update(buffer, 0, bytesRead);
             }
-            return HexFormat.of().formatHex(digest.digest());
+            return toHex(digest.digest());
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("Algoritmul SHA-256 nu este disponibil in JDK", e);
         }
@@ -35,9 +34,17 @@ public final class ChecksumUtil {
     public static String sha256(byte[] data) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(data));
+            return toHex(digest.digest(data));
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("Algoritmul SHA-256 nu este disponibil in JDK", e);
         }
+    }
+
+    private static String toHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b & 0xff));
+        }
+        return sb.toString();
     }
 }
