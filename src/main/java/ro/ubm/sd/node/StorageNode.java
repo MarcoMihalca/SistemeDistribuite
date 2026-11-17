@@ -1,12 +1,14 @@
 package ro.ubm.sd.node;
 
+import ro.ubm.sd.common.ChecksumUtil;
 import ro.ubm.sd.common.FileMetadata;
 import ro.ubm.sd.common.NodeInfo;
 import ro.ubm.sd.common.NodeState;
+import ro.ubm.sd.common.Protocol;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.lang.management.ManagementFactory;
@@ -20,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -28,9 +31,11 @@ import java.util.Scanner;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
@@ -55,11 +60,15 @@ public class StorageNode {
     private final Path storageDir;
     private volatile boolean coordinator;
     private final long pid;
+    private final String multicastGroup;
+    private final int multicastPort;
+    private final boolean probeDefaultPorts;
 
     private volatile boolean running = true;
     private volatile boolean heartbeatPaused = false;
     private ServerSocket serverSocket;
     private MulticastSocket multicastSocket;
+    private final ExecutorService tcpPool;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2, r -> {
         Thread t = new Thread(r, "heartbeat-scheduler");
         t.setDaemon(true);
@@ -69,8 +78,14 @@ public class StorageNode {
     // Tabelele mentinute in memorie de coordonator (Pasul 3)
     private final Map<UUID, FileMetadata> fileMetadataTable = new ConcurrentHashMap<>();
     private final Map<String, NodeInfo> clusterNodes = new ConcurrentHashMap<>();
+    private final AtomicInteger allocationCounter = new AtomicInteger(0);
 
     public StorageNode(String id, String host, int port, String storageDirText, boolean coordinator) {
+        this(id, host, port, storageDirText, coordinator, MULTICAST_GROUP, MULTICAST_PORT, true);
+    }
+
+    public StorageNode(String id, String host, int port, String storageDirText, boolean coordinator,
+                       String multicastGroup, int multicastPort, boolean probeDefaultPorts) {
         this.id = id;
         this.host = host;
         this.port = port;
@@ -78,6 +93,14 @@ public class StorageNode {
         this.storageDir = Paths.get(storageDirText);
         this.coordinator = coordinator;
         this.pid = resolveCurrentPid();
+        this.multicastGroup = multicastGroup;
+        this.multicastPort = multicastPort;
+        this.probeDefaultPorts = probeDefaultPorts;
+        this.tcpPool = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "tcp-handler-" + id);
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     private static long resolveCurrentPid() {
@@ -125,9 +148,7 @@ public class StorageNode {
         while (running && !serverSocket.isClosed()) {
             try {
                 final Socket clientSocket = serverSocket.accept();
-                Thread handler = new Thread(() -> handleTcpConnection(clientSocket), "tcp-handler-" + id);
-                handler.setDaemon(true);
-                handler.start();
+                tcpPool.submit(() -> handleTcpConnection(clientSocket));
             } catch (IOException e) {
                 if (running) {
                     System.err.printf("[%s] Eroare la acceptarea conexiunii TCP: %s%n", id, e.getMessage());
@@ -137,11 +158,12 @@ public class StorageNode {
     }
 
     private void handleTcpConnection(Socket socket) {
-        try (Socket s = socket;
-             BufferedReader reader = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
-             PrintWriter writer = new PrintWriter(new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8), true)) {
+        try (Socket s = socket) {
+            s.setSoTimeout(30_000);
+            InputStream in = s.getInputStream();
+            OutputStream out = s.getOutputStream();
 
-            String line = reader.readLine();
+            String line = Protocol.readHeaderLine(in);
             if (line == null || line.trim().isEmpty()) {
                 return;
             }
@@ -150,65 +172,56 @@ public class StorageNode {
             String command = parts[0].toUpperCase();
 
             switch (command) {
-                case "HEARTBEAT": {
+                case "HEARTBEAT":
                     handleHeartbeatMessage(parts);
-                    writer.println("OK");
-                    writer.flush();
+                    Protocol.writeHeaderLine(out, "OK");
                     break;
-                }
-                case "NODES_STATUS": {
-                    List<NodeInfo> sorted = clusterNodes.values().stream()
-                            .sorted(Comparator.comparing(NodeInfo::getId))
-                            .collect(Collectors.toList());
-                    String coordId = sorted.stream()
-                            .filter(NodeInfo::isCoordinator)
-                            .map(NodeInfo::getId)
-                            .findFirst()
-                            .orElse("necunoscut");
-
-                    writer.println(String.format("CLUSTER_NODES %d %s %d %d",
-                            sorted.size(), coordId, HEARTBEAT_INTERVAL_SECONDS, CAZUT_INTERVAL_THRESHOLD));
-                    for (NodeInfo n : sorted) {
-                        writer.println(String.format("%s %s:%d %s %d %d %b %d",
-                                n.getId(),
-                                n.getHost(),
-                                n.getPort(),
-                                n.getState().name(),
-                                n.getLastHeartbeat(),
-                                n.getMissedIntervals(),
-                                n.isCoordinator(),
-                                n.getPid()));
-                    }
-                    writer.flush();
+                case "NODES_STATUS":
+                    handleNodesStatus(out);
                     break;
-                }
-                case "FREEZE": {
+                case "FREEZE":
                     heartbeatPaused = true;
                     System.out.printf("[%s] [TEST] Emiterea de HEARTBEAT a fost OPRITA (freeze). Procesul (PID=%d) asteapta detectia...%n", id, pid);
-                    writer.println("FROZEN " + id);
-                    writer.flush();
+                    Protocol.writeHeaderLine(out, "FROZEN " + id);
                     break;
-                }
-                case "UNFREEZE": {
+                case "UNFREEZE":
                     heartbeatPaused = false;
                     System.out.printf("[%s] [TEST] Emiterea de HEARTBEAT a fost RELUATA.%n", id);
                     emitHeartbeatCycle();
-                    writer.println("UNFROZEN " + id);
-                    writer.flush();
+                    Protocol.writeHeaderLine(out, "UNFROZEN " + id);
                     break;
-                }
-                case "FORCE_KILL": {
+                case "FORCE_KILL":
                     System.err.printf("[%s] [KILL] Primit semnal FORCE_KILL de la coordonator (5 intervale ratate). Oprire proces (PID=%d)...%n", id, pid);
-                    writer.println("KILLED " + id);
-                    writer.flush();
+                    Protocol.writeHeaderLine(out, "KILLED " + id);
                     System.exit(137);
                     break;
-                }
-                default: {
-                    writer.println("ERROR UNKNOWN_COMMAND");
-                    writer.flush();
+                case "PUT":
+                    handlePut(parts, in, out);
                     break;
-                }
+                case "GET":
+                    handleGet(parts, out);
+                    break;
+                case "ALLOCATE":
+                    handleAllocate(parts, out);
+                    break;
+                case "COMMIT":
+                    handleCommit(parts, out);
+                    break;
+                case "LOCATE":
+                    handleLocate(parts, out);
+                    break;
+                case "LIST":
+                    handleList(out);
+                    break;
+                case "DELETE":
+                    handleDelete(parts, out);
+                    break;
+                case "REMOVE_REPLICA":
+                    handleRemoveReplica(parts, out);
+                    break;
+                default:
+                    Protocol.writeHeaderLine(out, "ERROR UNKNOWN_COMMAND");
+                    break;
             }
         } catch (Throwable t) {
             if (running) {
@@ -217,12 +230,323 @@ public class StorageNode {
         }
     }
 
+    private void handleNodesStatus(OutputStream out) throws IOException {
+        List<NodeInfo> sorted = clusterNodes.values().stream()
+                .sorted(Comparator.comparing(NodeInfo::getId))
+                .collect(Collectors.toList());
+        String coordId = sorted.stream()
+                .filter(NodeInfo::isCoordinator)
+                .map(NodeInfo::getId)
+                .findFirst()
+                .orElse("necunoscut");
+
+        Protocol.writeHeaderLine(out, String.format("CLUSTER_NODES %d %s %d %d",
+                sorted.size(), coordId, HEARTBEAT_INTERVAL_SECONDS, CAZUT_INTERVAL_THRESHOLD));
+        for (NodeInfo n : sorted) {
+            Protocol.writeHeaderLine(out, String.format("%s %s:%d %s %d %d %b %d",
+                    n.getId(),
+                    n.getHost(),
+                    n.getPort(),
+                    n.getState().name(),
+                    n.getLastHeartbeat(),
+                    n.getMissedIntervals(),
+                    n.isCoordinator(),
+                    n.getPid()));
+        }
+    }
+
+    private void handlePut(String[] parts, InputStream in, OutputStream out) throws IOException {
+        if (parts.length != 4) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_PUT_HEADER");
+            return;
+        }
+        String fileName;
+        try {
+            fileName = Protocol.sanitizeFileName(parts[1]);
+        } catch (IllegalArgumentException e) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_FILENAME");
+            return;
+        }
+
+        long size;
+        try {
+            size = Long.parseLong(parts[2]);
+        } catch (NumberFormatException e) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_SIZE");
+            return;
+        }
+        if (size < 0 || size > Protocol.MAX_FILE_SIZE) {
+            Protocol.writeHeaderLine(out, size < 0 ? "ERROR INVALID_SIZE" : "ERROR FILE_TOO_LARGE");
+            return;
+        }
+
+        String expectedSha = parts[3].trim().toLowerCase();
+        Path tmp = storageDir.resolve(fileName + ".part");
+        try {
+            String actualSha = Protocol.receiveBytes(in, size, tmp);
+            if (!actualSha.equalsIgnoreCase(expectedSha)) {
+                Files.deleteIfExists(tmp);
+                Protocol.writeHeaderLine(out, "ERROR CHECKSUM_MISMATCH");
+                return;
+            }
+            Protocol.moveAtomically(tmp, storageDir.resolve(fileName));
+            System.out.printf("[%s] [PUT] Stocat %s (%d octeti, sha256=%s)%n", id, fileName, size, actualSha);
+            Protocol.writeHeaderLine(out, "STORED " + actualSha);
+        } catch (IOException e) {
+            Files.deleteIfExists(tmp);
+            throw e;
+        }
+    }
+
+    private void handleGet(String[] parts, OutputStream out) throws IOException {
+        if (parts.length != 2) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_GET_HEADER");
+            return;
+        }
+        String fileName;
+        try {
+            fileName = Protocol.sanitizeFileName(parts[1]);
+        } catch (IllegalArgumentException e) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_FILENAME");
+            return;
+        }
+
+        Path target = storageDir.resolve(fileName);
+        if (!Files.isRegularFile(target)) {
+            Protocol.writeHeaderLine(out, "NOT_FOUND");
+            return;
+        }
+
+        long size = Files.size(target);
+        String sha256 = ChecksumUtil.sha256(target);
+        Protocol.writeHeaderLine(out, "FILE " + size + " " + sha256);
+        Protocol.sendFileBytes(target, out);
+        System.out.printf("[%s] [GET] Trimis %s (%d octeti)%n", id, fileName, size);
+    }
+
+    private void handleAllocate(String[] parts, OutputStream out) throws IOException {
+        if (!coordinator) {
+            Protocol.writeHeaderLine(out, "ERROR NOT_COORDINATOR");
+            return;
+        }
+        if (parts.length != 4) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_ALLOCATE_HEADER");
+            return;
+        }
+        String fileName;
+        try {
+            fileName = Protocol.sanitizeFileName(parts[1]);
+        } catch (IllegalArgumentException e) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_FILENAME");
+            return;
+        }
+
+        long size;
+        try {
+            size = Long.parseLong(parts[2]);
+        } catch (NumberFormatException e) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_SIZE");
+            return;
+        }
+        if (size < 0 || size > Protocol.MAX_FILE_SIZE) {
+            Protocol.writeHeaderLine(out, size < 0 ? "ERROR INVALID_SIZE" : "ERROR FILE_TOO_LARGE");
+            return;
+        }
+
+        boolean alreadyExists = fileMetadataTable.values().stream()
+                .anyMatch(m -> m.getName().equals(fileName));
+        if (alreadyExists) {
+            Protocol.writeHeaderLine(out, "ERROR FILE_ALREADY_EXISTS");
+            return;
+        }
+
+        List<NodeInfo> activeNodes = clusterNodes.values().stream()
+                .filter(n -> n.getState() == NodeState.ACTIV)
+                .sorted(Comparator.comparing(NodeInfo::getId))
+                .collect(Collectors.toList());
+        List<NodeInfo> storageOnly = activeNodes.stream()
+                .filter(n -> !n.isCoordinator())
+                .collect(Collectors.toList());
+        List<NodeInfo> candidates = storageOnly.isEmpty() ? activeNodes : storageOnly;
+
+        if (candidates.isEmpty()) {
+            Protocol.writeHeaderLine(out, "ERROR NO_ACTIVE_NODES");
+            return;
+        }
+
+        int idx = Math.floorMod(allocationCounter.getAndIncrement(), candidates.size());
+        NodeInfo chosen = candidates.get(idx);
+        UUID fileId = UUID.randomUUID();
+
+        Protocol.writeHeaderLine(out, String.format("NODES %s %s@%s:%d",
+                fileId, chosen.getId(), chosen.getHost(), chosen.getPort()));
+    }
+
+    private void handleCommit(String[] parts, OutputStream out) throws IOException {
+        if (!coordinator) {
+            Protocol.writeHeaderLine(out, "ERROR NOT_COORDINATOR");
+            return;
+        }
+        if (parts.length != 6) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_HEADER");
+            return;
+        }
+        UUID fileId;
+        String fileName;
+        long size;
+        try {
+            fileId = UUID.fromString(parts[1]);
+            fileName = Protocol.sanitizeFileName(parts[2]);
+            size = Long.parseLong(parts[3]);
+        } catch (IllegalArgumentException e) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_DATA");
+            return;
+        }
+        String checksum = parts[4].trim().toLowerCase();
+        List<String> replicaNodes = Arrays.stream(parts[5].split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toList());
+        if (replicaNodes.isEmpty()) {
+            Protocol.writeHeaderLine(out, "ERROR NO_REPLICA_NODES");
+            return;
+        }
+
+        boolean duplicateName = fileMetadataTable.values().stream()
+                .anyMatch(m -> m.getName().equals(fileName) && !m.getId().equals(fileId));
+        if (duplicateName) {
+            Protocol.writeHeaderLine(out, "ERROR FILE_ALREADY_EXISTS");
+            return;
+        }
+
+        fileMetadataTable.put(fileId, new FileMetadata(fileId, fileName, size, checksum, replicaNodes));
+        System.out.printf("[%s] [COMMIT] Inregistrat %s (id=%s, noduri=%s)%n", id, fileName, fileId, replicaNodes);
+        Protocol.writeHeaderLine(out, "OK");
+    }
+
+    private void handleLocate(String[] parts, OutputStream out) throws IOException {
+        if (!coordinator) {
+            Protocol.writeHeaderLine(out, "ERROR NOT_COORDINATOR");
+            return;
+        }
+        if (parts.length != 2) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_LOCATE_HEADER");
+            return;
+        }
+        FileMetadata meta = findMetadata(parts[1]);
+        if (meta == null) {
+            Protocol.writeHeaderLine(out, "NOT_FOUND");
+            return;
+        }
+
+        String locations = meta.getReplicaNodes().stream()
+                .map(clusterNodes::get)
+                .filter(n -> n != null && n.getState() != NodeState.CAZUT)
+                .map(n -> String.format("%s@%s:%d", n.getId(), n.getHost(), n.getPort()))
+                .collect(Collectors.joining(","));
+
+        if (locations.isEmpty()) {
+            Protocol.writeHeaderLine(out, "ERROR REPLICA_OFFLINE");
+            return;
+        }
+
+        Protocol.writeHeaderLine(out, String.format("LOCATIONS %s %s %d %s %s",
+                meta.getId(), meta.getName(), meta.getSize(), meta.getChecksum(), locations));
+    }
+
+    private void handleList(OutputStream out) throws IOException {
+        if (!coordinator) {
+            Protocol.writeHeaderLine(out, "ERROR NOT_COORDINATOR");
+            return;
+        }
+        List<FileMetadata> files = fileMetadataTable.values().stream()
+                .sorted(Comparator.comparing(FileMetadata::getName))
+                .collect(Collectors.toList());
+
+        Protocol.writeHeaderLine(out, "FILE_LIST " + files.size());
+        for (FileMetadata m : files) {
+            Protocol.writeHeaderLine(out, String.format("%s %s %d %s %s",
+                    m.getId(), m.getName(), m.getSize(), m.getChecksum(), String.join(",", m.getReplicaNodes())));
+        }
+    }
+
+    private void handleDelete(String[] parts, OutputStream out) throws IOException {
+        if (!coordinator) {
+            Protocol.writeHeaderLine(out, "ERROR NOT_COORDINATOR");
+            return;
+        }
+        if (parts.length != 2) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_DELETE_HEADER");
+            return;
+        }
+        FileMetadata meta = findMetadata(parts[1]);
+        if (meta == null) {
+            Protocol.writeHeaderLine(out, "NOT_FOUND");
+            return;
+        }
+
+        fileMetadataTable.remove(meta.getId());
+        for (String nodeId : meta.getReplicaNodes()) {
+            if (nodeId.equals(this.id)) {
+                Files.deleteIfExists(storageDir.resolve(meta.getName()));
+                continue;
+            }
+            NodeInfo target = clusterNodes.get(nodeId);
+            if (target != null && target.getState() != NodeState.CAZUT) {
+                try (Socket s = new Socket()) {
+                    s.connect(new InetSocketAddress(target.getHost(), target.getPort()), 1000);
+                    Protocol.writeHeaderLine(s.getOutputStream(), "REMOVE_REPLICA " + meta.getName());
+                    Protocol.readHeaderLine(s.getInputStream());
+                } catch (IOException ignored) {
+                }
+            }
+        }
+        System.out.printf("[%s] [DELETE] Sters %s (id=%s)%n", id, meta.getName(), meta.getId());
+        Protocol.writeHeaderLine(out, "DELETED " + meta.getId() + " " + meta.getName());
+    }
+
+    private void handleRemoveReplica(String[] parts, OutputStream out) throws IOException {
+        if (parts.length != 2) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_REMOVE_HEADER");
+            return;
+        }
+        String fileName;
+        try {
+            fileName = Protocol.sanitizeFileName(parts[1]);
+        } catch (IllegalArgumentException e) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_FILENAME");
+            return;
+        }
+        boolean deleted = Files.deleteIfExists(storageDir.resolve(fileName));
+        if (deleted) {
+            System.out.printf("[%s] [REMOVE_REPLICA] Sters %s de pe disc%n", id, fileName);
+        }
+        Protocol.writeHeaderLine(out, (deleted ? "REMOVED " : "NOT_FOUND ") + fileName);
+    }
+
+    private FileMetadata findMetadata(String query) {
+        try {
+            UUID uuid = UUID.fromString(query);
+            FileMetadata byId = fileMetadataTable.get(uuid);
+            if (byId != null) {
+                return byId;
+            }
+        } catch (IllegalArgumentException ignored) {
+        }
+        for (FileMetadata meta : fileMetadataTable.values()) {
+            if (meta.getName().equals(query)) {
+                return meta;
+            }
+        }
+        return null;
+    }
+
     @SuppressWarnings("deprecation")
     private void startMulticastReceiver() {
         try {
-            multicastSocket = new MulticastSocket(MULTICAST_PORT);
+            multicastSocket = new MulticastSocket(multicastPort);
             multicastSocket.setReuseAddress(true);
-            InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
+            InetAddress group = InetAddress.getByName(multicastGroup);
             multicastSocket.joinGroup(group);
 
             Thread multicastThread = new Thread(() -> {
@@ -270,8 +594,8 @@ public class StorageNode {
             if (multicastSocket != null && !multicastSocket.isClosed()) {
                 try {
                     byte[] data = msg.getBytes(StandardCharsets.UTF_8);
-                    InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
-                    DatagramPacket packet = new DatagramPacket(data, data.length, group, MULTICAST_PORT);
+                    InetAddress group = InetAddress.getByName(multicastGroup);
+                    DatagramPacket packet = new DatagramPacket(data, data.length, group, multicastPort);
                     multicastSocket.send(packet);
                 } catch (IOException ignored) {
                 }
@@ -279,9 +603,11 @@ public class StorageNode {
 
             // 2. Emite prin TCP catre nodurile cunoscute si porturile locale standard (garanteaza functionarea pe Windows localhost)
             Set<String> targets = new HashSet<>();
-            for (int localPort : DEFAULT_LOCAL_PORTS) {
-                if (localPort != this.port) {
-                    targets.add(this.host + ":" + localPort);
+            if (probeDefaultPorts) {
+                for (int localPort : DEFAULT_LOCAL_PORTS) {
+                    if (localPort != this.port) {
+                        targets.add(this.host + ":" + localPort);
+                    }
                 }
             }
             for (NodeInfo info : clusterNodes.values()) {
@@ -447,6 +773,7 @@ public class StorageNode {
     public void stop() {
         running = false;
         scheduler.shutdownNow();
+        tcpPool.shutdownNow();
         try {
             if (serverSocket != null) {
                 serverSocket.close();
