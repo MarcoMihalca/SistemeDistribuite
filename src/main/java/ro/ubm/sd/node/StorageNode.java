@@ -1,6 +1,8 @@
 package ro.ubm.sd.node;
 
 import ro.ubm.sd.common.ChecksumUtil;
+import ro.ubm.sd.common.ChunkMetadata;
+import ro.ubm.sd.common.ChunkPolicy;
 import ro.ubm.sd.common.FileMetadata;
 import ro.ubm.sd.common.NodeInfo;
 import ro.ubm.sd.common.NodeState;
@@ -22,8 +24,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -79,6 +83,7 @@ public class StorageNode {
     private final Map<UUID, FileMetadata> fileMetadataTable = new ConcurrentHashMap<>();
     private final Map<String, NodeInfo> clusterNodes = new ConcurrentHashMap<>();
     private final AtomicInteger allocationCounter = new AtomicInteger(0);
+    private final Object metadataLock = new Object();
 
     public StorageNode(String id, String host, int port, String storageDirText, boolean coordinator) {
         this(id, host, port, storageDirText, coordinator, MULTICAST_GROUP, MULTICAST_PORT, true);
@@ -159,7 +164,7 @@ public class StorageNode {
 
     private void handleTcpConnection(Socket socket) {
         try (Socket s = socket) {
-            s.setSoTimeout(30_000);
+            s.setSoTimeout(60_000);
             InputStream in = s.getInputStream();
             OutputStream out = s.getOutputStream();
 
@@ -205,7 +210,7 @@ public class StorageNode {
                     handleAllocate(parts, out);
                     break;
                 case "COMMIT":
-                    handleCommit(parts, out);
+                    handleCommit(parts, in, out);
                     break;
                 case "LOCATE":
                     handleLocate(parts, out);
@@ -364,63 +369,147 @@ public class StorageNode {
                 .filter(n -> n.getState() == NodeState.ACTIV)
                 .sorted(Comparator.comparing(NodeInfo::getId))
                 .collect(Collectors.toList());
-        List<NodeInfo> storageOnly = activeNodes.stream()
-                .filter(n -> !n.isCoordinator())
-                .collect(Collectors.toList());
-        List<NodeInfo> candidates = storageOnly.isEmpty() ? activeNodes : storageOnly;
-
-        if (candidates.isEmpty()) {
+        if (activeNodes.isEmpty()) {
             Protocol.writeHeaderLine(out, "ERROR NO_ACTIVE_NODES");
             return;
         }
 
-        int idx = Math.floorMod(allocationCounter.getAndIncrement(), candidates.size());
-        NodeInfo chosen = candidates.get(idx);
+        long chunkSize = ChunkPolicy.chunkSizeFor(size);
+        int chunkCount = ChunkPolicy.chunkCountFor(size);
         UUID fileId = UUID.randomUUID();
 
-        Protocol.writeHeaderLine(out, String.format("NODES %s %s@%s:%d",
-                fileId, chosen.getId(), chosen.getHost(), chosen.getPort()));
+        // Least-Bytes-Used Striping: calculam incarcarea curenta a fiecarui nod activ
+        Map<String, Long> loadBytes = new HashMap<>();
+        for (NodeInfo n : activeNodes) {
+            loadBytes.put(n.getId(), 0L);
+        }
+        for (FileMetadata existing : fileMetadataTable.values()) {
+            for (ChunkMetadata cm : existing.getChunks()) {
+                for (String replicaNodeId : cm.getReplicaNodes()) {
+                    Long current = loadBytes.get(replicaNodeId);
+                    if (current != null) {
+                        loadBytes.put(replicaNodeId, current + cm.getSize());
+                    }
+                }
+            }
+        }
+
+        int tieStart = Math.floorMod(allocationCounter.getAndIncrement(), activeNodes.size());
+        Protocol.writeHeaderLine(out, String.format("ALLOC_PLAN %s %d %d", fileId, chunkSize, chunkCount));
+        for (int i = 0; i < chunkCount; i++) {
+            long offset = (long) i * chunkSize;
+            long chunkLen = ChunkPolicy.chunkLengthAt(size, chunkSize, i);
+            String chunkId = ChunkPolicy.chunkFileName(fileId, i);
+            NodeInfo chosen = pickLeastLoadedNode(activeNodes, loadBytes, (tieStart + i) % activeNodes.size());
+            loadBytes.put(chosen.getId(), loadBytes.get(chosen.getId()) + chunkLen);
+            Protocol.writeHeaderLine(out, String.format("CHUNK %d %s %d %d %s@%s:%d",
+                    i, chunkId, offset, chunkLen, chosen.getId(), chosen.getHost(), chosen.getPort()));
+        }
     }
 
-    private void handleCommit(String[] parts, OutputStream out) throws IOException {
+    private NodeInfo pickLeastLoadedNode(List<NodeInfo> activeNodes, Map<String, Long> loadBytes, int startIndex) {
+        NodeInfo best = activeNodes.get(startIndex);
+        long bestLoad = loadBytes.get(best.getId());
+        for (int step = 1; step < activeNodes.size(); step++) {
+            NodeInfo candidate = activeNodes.get((startIndex + step) % activeNodes.size());
+            long candidateLoad = loadBytes.get(candidate.getId());
+            if (candidateLoad < bestLoad) {
+                best = candidate;
+                bestLoad = candidateLoad;
+            }
+        }
+        return best;
+    }
+
+    private void handleCommit(String[] parts, InputStream in, OutputStream out) throws IOException {
         if (!coordinator) {
             Protocol.writeHeaderLine(out, "ERROR NOT_COORDINATOR");
             return;
         }
-        if (parts.length != 6) {
+        if (parts.length != 7) {
             Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_HEADER");
             return;
         }
         UUID fileId;
         String fileName;
         long size;
+        long chunkSize;
+        int chunkCount;
         try {
             fileId = UUID.fromString(parts[1]);
             fileName = Protocol.sanitizeFileName(parts[2]);
             size = Long.parseLong(parts[3]);
+            chunkSize = Long.parseLong(parts[5]);
+            chunkCount = Integer.parseInt(parts[6]);
         } catch (IllegalArgumentException e) {
             Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_DATA");
             return;
         }
-        String checksum = parts[4].trim().toLowerCase();
-        List<String> replicaNodes = Arrays.stream(parts[5].split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .collect(Collectors.toList());
-        if (replicaNodes.isEmpty()) {
-            Protocol.writeHeaderLine(out, "ERROR NO_REPLICA_NODES");
+        String fullChecksum = parts[4].trim().toLowerCase();
+        if (size < 0 || size > Protocol.MAX_FILE_SIZE || chunkSize < 0
+                || fullChecksum.isEmpty() || chunkCount < 1 || chunkCount > 4096) {
+            Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_DATA");
             return;
         }
 
-        boolean duplicateName = fileMetadataTable.values().stream()
-                .anyMatch(m -> m.getName().equals(fileName) && !m.getId().equals(fileId));
-        if (duplicateName) {
-            Protocol.writeHeaderLine(out, "ERROR FILE_ALREADY_EXISTS");
+        List<ChunkMetadata> chunks = new ArrayList<>(chunkCount);
+        long expectedOffset = 0L;
+        for (int expectedIdx = 0; expectedIdx < chunkCount; expectedIdx++) {
+            String chunkLine = Protocol.readHeaderLine(in);
+            if (chunkLine == null) {
+                Protocol.writeHeaderLine(out, "ERROR INCOMPLETE_COMMIT");
+                return;
+            }
+            String[] cp = chunkLine.trim().split("\\s+");
+            if (cp.length != 7 || !"CHUNK".equalsIgnoreCase(cp[0])) {
+                Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_CHUNK");
+                return;
+            }
+            int idx;
+            String chunkId;
+            long offset;
+            long chunkLen;
+            try {
+                idx = Integer.parseInt(cp[1]);
+                chunkId = Protocol.sanitizeFileName(cp[2]);
+                offset = Long.parseLong(cp[3]);
+                chunkLen = Long.parseLong(cp[4]);
+            } catch (IllegalArgumentException e) {
+                Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_CHUNK");
+                return;
+            }
+            String chunkSha = cp[5].trim().toLowerCase();
+            List<String> nodeIds = Arrays.stream(cp[6].split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.toList());
+
+            if (idx != expectedIdx || offset != expectedOffset || chunkLen < 0
+                    || chunkSha.isEmpty() || nodeIds.isEmpty()) {
+                Protocol.writeHeaderLine(out, "ERROR INVALID_COMMIT_CHUNK");
+                return;
+            }
+            expectedOffset += chunkLen;
+            chunks.add(new ChunkMetadata(idx, chunkId, offset, chunkLen, chunkSha, nodeIds));
+        }
+
+        if (expectedOffset != size) {
+            Protocol.writeHeaderLine(out, "ERROR CHUNK_SIZE_MISMATCH");
             return;
         }
 
-        fileMetadataTable.put(fileId, new FileMetadata(fileId, fileName, size, checksum, replicaNodes));
-        System.out.printf("[%s] [COMMIT] Inregistrat %s (id=%s, noduri=%s)%n", id, fileName, fileId, replicaNodes);
+        FileMetadata meta = new FileMetadata(fileId, fileName, size, fullChecksum, chunkSize, chunks);
+        synchronized (metadataLock) {
+            boolean duplicateName = fileMetadataTable.values().stream()
+                    .anyMatch(m -> m.getName().equals(fileName) && !m.getId().equals(fileId));
+            if (duplicateName) {
+                Protocol.writeHeaderLine(out, "ERROR FILE_ALREADY_EXISTS");
+                return;
+            }
+            fileMetadataTable.put(fileId, meta);
+        }
+        System.out.printf("[%s] [COMMIT] Inregistrat %s (id=%s, size=%d, chunks=%d, noduri=%s)%n",
+                id, fileName, fileId, size, chunks.size(), meta.getReplicaNodes());
         Protocol.writeHeaderLine(out, "OK");
     }
 
@@ -439,19 +528,28 @@ public class StorageNode {
             return;
         }
 
-        String locations = meta.getReplicaNodes().stream()
-                .map(clusterNodes::get)
-                .filter(n -> n != null && n.getState() != NodeState.CAZUT)
-                .map(n -> String.format("%s@%s:%d", n.getId(), n.getHost(), n.getPort()))
-                .collect(Collectors.joining(","));
-
-        if (locations.isEmpty()) {
-            Protocol.writeHeaderLine(out, "ERROR REPLICA_OFFLINE");
-            return;
+        List<String> chunkLines = new ArrayList<>(meta.getChunkCount());
+        for (ChunkMetadata chunk : meta.getChunks()) {
+            String endpoints = chunk.getReplicaNodes().stream()
+                    .map(clusterNodes::get)
+                    .filter(n -> n != null && n.getState() != NodeState.CAZUT)
+                    .map(n -> String.format("%s@%s:%d", n.getId(), n.getHost(), n.getPort()))
+                    .collect(Collectors.joining(","));
+            if (endpoints.isEmpty()) {
+                Protocol.writeHeaderLine(out, "ERROR CHUNK_OFFLINE " + chunk.getIndex());
+                return;
+            }
+            chunkLines.add(String.format("CHUNK %d %s %d %d %s %s",
+                    chunk.getIndex(), chunk.getChunkId(), chunk.getOffset(),
+                    chunk.getSize(), chunk.getChecksum(), endpoints));
         }
 
-        Protocol.writeHeaderLine(out, String.format("LOCATIONS %s %s %d %s %s",
-                meta.getId(), meta.getName(), meta.getSize(), meta.getChecksum(), locations));
+        Protocol.writeHeaderLine(out, String.format("LOCATIONS %s %s %d %s %d %d",
+                meta.getId(), meta.getName(), meta.getSize(), meta.getChecksum(),
+                meta.getChunkSize(), meta.getChunkCount()));
+        for (String line : chunkLines) {
+            Protocol.writeHeaderLine(out, line);
+        }
     }
 
     private void handleList(OutputStream out) throws IOException {
@@ -465,8 +563,9 @@ public class StorageNode {
 
         Protocol.writeHeaderLine(out, "FILE_LIST " + files.size());
         for (FileMetadata m : files) {
-            Protocol.writeHeaderLine(out, String.format("%s %s %d %s %s",
-                    m.getId(), m.getName(), m.getSize(), m.getChecksum(), String.join(",", m.getReplicaNodes())));
+            Protocol.writeHeaderLine(out, String.format("%s %s %d %s %d %d %s",
+                    m.getId(), m.getName(), m.getSize(), m.getChecksum(),
+                    m.getChunkCount(), m.getChunkSize(), String.join(",", m.getReplicaNodes())));
         }
     }
 
@@ -479,30 +578,38 @@ public class StorageNode {
             Protocol.writeHeaderLine(out, "ERROR INVALID_DELETE_HEADER");
             return;
         }
-        FileMetadata meta = findMetadata(parts[1]);
-        if (meta == null) {
-            Protocol.writeHeaderLine(out, "NOT_FOUND");
-            return;
+        FileMetadata meta;
+        synchronized (metadataLock) {
+            meta = findMetadata(parts[1]);
+            if (meta == null) {
+                Protocol.writeHeaderLine(out, "NOT_FOUND");
+                return;
+            }
+            fileMetadataTable.remove(meta.getId());
         }
 
-        fileMetadataTable.remove(meta.getId());
-        for (String nodeId : meta.getReplicaNodes()) {
-            if (nodeId.equals(this.id)) {
-                Files.deleteIfExists(storageDir.resolve(meta.getName()));
-                continue;
-            }
-            NodeInfo target = clusterNodes.get(nodeId);
-            if (target != null && target.getState() != NodeState.CAZUT) {
-                try (Socket s = new Socket()) {
-                    s.connect(new InetSocketAddress(target.getHost(), target.getPort()), 1000);
-                    Protocol.writeHeaderLine(s.getOutputStream(), "REMOVE_REPLICA " + meta.getName());
-                    Protocol.readHeaderLine(s.getInputStream());
-                } catch (IOException ignored) {
+        for (ChunkMetadata chunk : meta.getChunks()) {
+            for (String nodeId : chunk.getReplicaNodes()) {
+                if (nodeId.equals(this.id)) {
+                    Files.deleteIfExists(storageDir.resolve(chunk.getChunkId()));
+                    continue;
+                }
+                NodeInfo target = clusterNodes.get(nodeId);
+                if (target != null && target.getState() != NodeState.CAZUT) {
+                    try (Socket s = new Socket()) {
+                        s.connect(new InetSocketAddress(target.getHost(), target.getPort()), 1000);
+                        s.setSoTimeout(2000);
+                        Protocol.writeHeaderLine(s.getOutputStream(), "REMOVE_REPLICA " + chunk.getChunkId());
+                        Protocol.readHeaderLine(s.getInputStream());
+                    } catch (IOException ignored) {
+                    }
                 }
             }
         }
-        System.out.printf("[%s] [DELETE] Sters %s (id=%s)%n", id, meta.getName(), meta.getId());
-        Protocol.writeHeaderLine(out, "DELETED " + meta.getId() + " " + meta.getName());
+        System.out.printf("[%s] [DELETE] Sters %s (id=%s, chunks=%d)%n",
+                id, meta.getName(), meta.getId(), meta.getChunkCount());
+        Protocol.writeHeaderLine(out, String.format("DELETED %s %s %d",
+                meta.getId(), meta.getName(), meta.getChunkCount()));
     }
 
     private void handleRemoveReplica(String[] parts, OutputStream out) throws IOException {

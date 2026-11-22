@@ -5,23 +5,26 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
 /**
  * Utilitare pentru incadrarea mesajelor TCP (antet UTF-8 terminat cu '\n' + continut binar)
- * si transferul in flux al fisierelor in blocuri de 64 KB (compatibil Java 8).
+ * si transferul in flux al fisierelor si bucatilor in blocuri de 64 KB (compatibil Java 8).
  */
 public final class Protocol {
 
     public static final int BUFFER_SIZE = 64 * 1024;
-    public static final long MAX_FILE_SIZE = 512L * 1024L * 1024L;
+    public static final long MAX_FILE_SIZE = 4L * 1024L * 1024L * 1024L;
     private static final int MAX_HEADER_BYTES = 16 * 1024;
 
     private Protocol() {
@@ -88,6 +91,41 @@ public final class Protocol {
     }
 
     /**
+     * Citeste exact {@code size} octeti din fluxul TCP, ii scrie direct la {@code offset}
+     * in {@code targetChannel} (sigur pentru intervale disjuncte scrise in paralel) si returneaza SHA-256.
+     */
+    public static String receiveBytesToChannel(InputStream in, long size,
+                                               FileChannel targetChannel, long offset) throws IOException {
+        if (size < 0 || offset < 0) {
+            throw new IllegalArgumentException("Parametri invalizi: size=" + size + ", offset=" + offset);
+        }
+        MessageDigest sha = newSha256Digest();
+        if (size == 0L) {
+            return ChecksumUtil.toHex(sha.digest());
+        }
+
+        byte[] buffer = new byte[BUFFER_SIZE];
+        long pos = offset;
+        long remaining = size;
+
+        while (remaining > 0) {
+            int toRead = (int) Math.min(buffer.length, remaining);
+            int n = in.read(buffer, 0, toRead);
+            if (n < 0) {
+                throw new EOFException("Conexiune inchisa dupa " + (size - remaining)
+                        + " din " + size + " octeti");
+            }
+            sha.update(buffer, 0, n);
+            ByteBuffer bb = ByteBuffer.wrap(buffer, 0, n);
+            while (bb.hasRemaining()) {
+                pos += targetChannel.write(bb, pos);
+            }
+            remaining -= n;
+        }
+        return ChecksumUtil.toHex(sha.digest());
+    }
+
+    /**
      * Trimite continutul unui fisier pe fluxul TCP in blocuri de 64 KB.
      */
     public static void sendFileBytes(Path source, OutputStream out) throws IOException {
@@ -96,6 +134,43 @@ public final class Protocol {
             int n;
             while ((n = in.read(buffer)) != -1) {
                 out.write(buffer, 0, n);
+            }
+        }
+        out.flush();
+    }
+
+    /**
+     * Trimite un interval [offset, offset + length) dintr-un fisier direct pe fluxul TCP
+     * folosind citiri pozitionale prin FileChannel (zero fisiere temporare).
+     */
+    public static void sendFileRange(Path source, long offset, long length, OutputStream out) throws IOException {
+        if (offset < 0 || length < 0) {
+            throw new IllegalArgumentException("Parametri invalizi: offset=" + offset + ", length=" + length);
+        }
+        try (FileChannel channel = FileChannel.open(source, StandardOpenOption.READ)) {
+            long fileSize = channel.size();
+            if (offset + length > fileSize) {
+                throw new EOFException("Interval in afara fisierului: offset=" + offset
+                        + ", length=" + length + ", fileSize=" + fileSize);
+            }
+            if (length == 0L) {
+                out.flush();
+                return;
+            }
+            byte[] buffer = new byte[BUFFER_SIZE];
+            long pos = offset;
+            long remaining = length;
+            while (remaining > 0) {
+                int toRead = (int) Math.min(buffer.length, remaining);
+                ByteBuffer bb = ByteBuffer.wrap(buffer, 0, toRead);
+                int n = channel.read(bb, pos);
+                if (n <= 0) {
+                    throw new EOFException("Citire incompleta din fisier la pozitia " + pos
+                            + " (ramasi " + remaining + " octeti)");
+                }
+                out.write(buffer, 0, n);
+                pos += n;
+                remaining -= n;
             }
         }
         out.flush();
