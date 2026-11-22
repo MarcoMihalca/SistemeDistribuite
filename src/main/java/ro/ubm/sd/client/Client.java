@@ -1,6 +1,7 @@
 package ro.ubm.sd.client;
 
 import ro.ubm.sd.common.ChecksumUtil;
+import ro.ubm.sd.common.ChunkPolicy;
 import ro.ubm.sd.common.Protocol;
 
 import java.io.IOException;
@@ -8,14 +9,26 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Interfata in terminal pentru client (mod interactiv sau comanda directa in linia de comanda).
@@ -28,7 +41,8 @@ import java.util.Scanner;
 public class Client {
 
     private static final int CONNECT_TIMEOUT_MS = 2000;
-    private static final int DATA_TIMEOUT_MS = 30_000;
+    private static final int DATA_TIMEOUT_MS = 60_000;
+    private static final int MAX_PARALLEL_CHUNKS = 4;
     private static final String DEFAULT_COORDINATOR = "localhost:7001";
 
     private final String coordinatorAddress;
@@ -43,7 +57,7 @@ public class Client {
     }
 
     public void start() {
-        System.out.printf("[client] coordonator configurat: %s; comenzi: put, get, ls, rm, nodes, freeze <port>, unfreeze <port>, help, exit%n",
+        System.out.printf("[client] coordonator configurat: %s; comenzi: put, get, ls, info, rm, nodes, freeze <port>, unfreeze <port>, help, exit%n",
                 coordinatorAddress);
 
         if (System.console() == null && !hasStandardInput()) {
@@ -88,6 +102,14 @@ public class Client {
             case "ls":
                 listFiles();
                 return true;
+            case "info":
+            case "stat":
+                if (parts.length < 2) {
+                    System.out.println("Utilizare: info <nume_sau_id>");
+                } else {
+                    showFileInfo(parts[1]);
+                }
+                return true;
             case "rm":
                 if (parts.length < 2) {
                     System.out.println("Utilizare: rm <nume_sau_id>");
@@ -121,7 +143,7 @@ public class Client {
                 System.out.println("[client] Inchidere client.");
                 return false;
             default:
-                System.out.println("Comanda necunoscuta. Comenzi disponibile: put, get, ls, rm, nodes, freeze <port>, unfreeze <port>, help, exit");
+                System.out.println("Comanda necunoscuta. Comenzi disponibile: put, get, ls, info, rm, nodes, freeze <port>, unfreeze <port>, help, exit");
                 return true;
         }
     }
@@ -161,54 +183,209 @@ public class Client {
 
         try {
             long size = Files.size(localPath);
-            String sha256 = ChecksumUtil.sha256(localPath);
+            long plannedChunkSize = ChunkPolicy.chunkSizeFor(size);
+            int plannedChunkCount = ChunkPolicy.chunkCountFor(size);
+            ChecksumUtil.FileHashSummary hashSummary =
+                    ChecksumUtil.sha256WithChunks(localPath, size, plannedChunkSize, plannedChunkCount);
+            String fullSha = hashSummary.getFullChecksum();
 
-            String allocResp;
+            String fileId;
+            long chunkSize;
+            int chunkCount;
+            List<UploadChunkPlan> plan = new ArrayList<>();
+
             try (Socket coordSock = connectSocket(coordinatorHost, coordinatorPort, DATA_TIMEOUT_MS)) {
-                Protocol.writeHeaderLine(coordSock.getOutputStream(),
-                        String.format("ALLOCATE %s %d %s", fileName, size, sha256));
-                allocResp = Protocol.readHeaderLine(coordSock.getInputStream());
+                OutputStream coordOut = coordSock.getOutputStream();
+                InputStream coordIn = coordSock.getInputStream();
+                Protocol.writeHeaderLine(coordOut,
+                        String.format("ALLOCATE %s %d %s", fileName, size, fullSha));
+
+                String allocResp = Protocol.readHeaderLine(coordIn);
+                if (allocResp == null) {
+                    System.out.println("[client] Eroare: coordonatorul a inchis conexiunea la ALLOCATE.");
+                    return;
+                }
+                if (!allocResp.startsWith("ALLOC_PLAN ")) {
+                    System.out.println("[client] Alocare refuzata: " + allocResp);
+                    return;
+                }
+
+                // ALLOC_PLAN <fileId> <chunkSize> <chunkCount>
+                String[] ap = allocResp.split("\\s+");
+                if (ap.length < 4) {
+                    System.out.println("[client] Raspuns ALLOC_PLAN invalid: " + allocResp);
+                    return;
+                }
+                fileId = ap[1];
+                chunkSize = Long.parseLong(ap[2]);
+                chunkCount = Integer.parseInt(ap[3]);
+                if (chunkCount < 1) {
+                    System.out.println("[client] Numar invalid de bucati la ALLOC_PLAN: " + chunkCount);
+                    return;
+                }
+
+                long expectedOffset = 0L;
+                for (int i = 0; i < chunkCount; i++) {
+                    String chunkLine = Protocol.readHeaderLine(coordIn);
+                    if (chunkLine == null) {
+                        System.out.println("[client] Eroare: plan de alocare incomplet de la coordonator.");
+                        return;
+                    }
+                    String[] cp = chunkLine.trim().split("\\s+");
+                    if (cp.length < 6 || !"CHUNK".equalsIgnoreCase(cp[0])) {
+                        System.out.println("[client] Linie CHUNK invalida in ALLOC_PLAN: " + chunkLine);
+                        return;
+                    }
+                    int idx = Integer.parseInt(cp[1]);
+                    String chunkId = cp[2];
+                    long offset = Long.parseLong(cp[3]);
+                    long chunkLen = Long.parseLong(cp[4]);
+                    NodeTarget target = parseNodeEndpoint(cp[5]);
+                    if (idx != i || offset != expectedOffset || chunkLen < 0) {
+                        System.out.println("[client] Plan de bucati nealiniat de la coordonator: " + chunkLine);
+                        return;
+                    }
+                    expectedOffset += chunkLen;
+                    plan.add(new UploadChunkPlan(idx, chunkId, offset, chunkLen, target));
+                }
+                if (expectedOffset != size) {
+                    System.out.printf("[client] Eroare: suma dimensiunilor bucatilor (%d) difera de dimensiunea fisierului (%d).%n",
+                            expectedOffset, size);
+                    return;
+                }
             }
 
-            if (allocResp == null) {
-                System.out.println("[client] Eroare: coordonatorul a inchis conexiunea la ALLOCATE.");
-                return;
+            if (chunkSize != plannedChunkSize || chunkCount != plannedChunkCount) {
+                hashSummary = ChecksumUtil.sha256WithChunks(localPath, size, chunkSize, chunkCount);
+                fullSha = hashSummary.getFullChecksum();
             }
-            if (!allocResp.startsWith("NODES ")) {
-                System.out.println("[client] Alocare refuzata: " + allocResp);
-                return;
+            List<String> chunkHashes = hashSummary.getChunkChecksums();
+
+            // Incarcam bucatile in paralel cu pool limitat; daca oricare esueaza, anulam tot si curatam.
+            int workerCount = Math.min(chunkCount, MAX_PARALLEL_CHUNKS);
+            ExecutorService pool = Executors.newFixedThreadPool(workerCount);
+            AtomicBoolean failed = new AtomicBoolean(false);
+            AtomicReference<String> errorMsg = new AtomicReference<>();
+            List<UploadedChunk> uploaded = Collections.synchronizedList(new ArrayList<>());
+
+            try {
+                List<Future<?>> futures = new ArrayList<>(chunkCount);
+                for (int i = 0; i < plan.size(); i++) {
+                    final UploadChunkPlan item = plan.get(i);
+                    final String chunkSha = chunkHashes.get(i);
+                    futures.add(pool.submit(() -> {
+                        if (failed.get()) {
+                            return;
+                        }
+                        try {
+                            boolean ok = uploadChunkRange(item.target, localPath, item.chunkId,
+                                    item.offset, item.size, chunkSha);
+                            if (ok) {
+                                uploaded.add(new UploadedChunk(item.chunkId, item.target));
+                            } else {
+                                failed.set(true);
+                                errorMsg.compareAndSet(null,
+                                        "Transferul bucatii " + item.index + " catre " + item.target.id + " a esuat.");
+                            }
+                        } catch (Exception e) {
+                            failed.set(true);
+                            errorMsg.compareAndSet(null,
+                                    "Eroare la transferul bucatii " + item.index + " catre "
+                                            + item.target.id + ": " + e.getMessage());
+                        }
+                    }));
+                }
+
+                for (Future<?> f : futures) {
+                    try {
+                        f.get();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        failed.set(true);
+                        errorMsg.compareAndSet(null, "Incarcarea a fost intrerupta.");
+                    } catch (ExecutionException e) {
+                        failed.set(true);
+                        Throwable cause = e.getCause() != null ? e.getCause() : e;
+                        errorMsg.compareAndSet(null, cause.getMessage());
+                    }
+                }
+            } finally {
+                pool.shutdownNow();
             }
 
-            // NODES <uuid> <nodeId>@<host>:<port>
-            String[] ap = allocResp.split("\\s+");
-            if (ap.length < 3) {
-                System.out.println("[client] Raspuns ALLOCATE invalid: " + allocResp);
-                return;
-            }
-            String fileId = ap[1];
-            NodeTarget target = parseNodeEndpoint(ap[2]);
-
-            boolean stored = uploadToNode(target.host, target.port, localPath, fileName, size, sha256);
-            if (!stored) {
+            if (failed.get()) {
+                cleanupUploadedChunks(uploaded);
+                System.out.println("[client] Incarcare anulata (fara COMMIT): "
+                        + (errorMsg.get() != null ? errorMsg.get() : "eroare necunoscuta"));
                 return;
             }
 
             String commitResp;
             try (Socket coordSock = connectSocket(coordinatorHost, coordinatorPort, DATA_TIMEOUT_MS)) {
-                Protocol.writeHeaderLine(coordSock.getOutputStream(),
-                        String.format("COMMIT %s %s %d %s %s", fileId, fileName, size, sha256, target.id));
+                OutputStream coordOut = coordSock.getOutputStream();
+                Protocol.writeHeaderLine(coordOut, String.format("COMMIT %s %s %d %s %d %d",
+                        fileId, fileName, size, fullSha, chunkSize, chunkCount));
+                for (int i = 0; i < plan.size(); i++) {
+                    UploadChunkPlan item = plan.get(i);
+                    Protocol.writeHeaderLine(coordOut, String.format("CHUNK %d %s %d %d %s %s",
+                            item.index, item.chunkId, item.offset, item.size, chunkHashes.get(i), item.target.id));
+                }
                 commitResp = Protocol.readHeaderLine(coordSock.getInputStream());
             }
 
             if (!"OK".equals(commitResp)) {
+                cleanupUploadedChunks(uploaded);
                 System.out.println("[client] Eroare la COMMIT pe coordonator: " + commitResp);
                 return;
             }
 
-            System.out.printf("[client] Incarcat cu succes: %s (id=%s, dimensiune=%d octeti, sha256=%s, nod=[%s@%s:%d])%n",
-                    fileName, fileId, size, sha256, target.id, target.host, target.port);
+            Set<String> usedNodes = new LinkedHashSet<>();
+            for (UploadChunkPlan item : plan) {
+                usedNodes.add(item.target.id);
+            }
+            System.out.printf("[client] Incarcat cu succes: %s (id=%s, dimensiune=%d octeti, bucati=%d x %s, sha256=%s, noduri=%s)%n",
+                    fileName, fileId, size, chunkCount, ChunkPolicy.formatHumanSize(chunkSize), fullSha, usedNodes);
         } catch (IOException e) {
             System.out.printf("[client] Eroare la incarcarea fisierului '%s': %s%n", localFileArg, e.getMessage());
+        }
+    }
+
+    private boolean uploadChunkRange(NodeTarget target, Path localPath, String chunkId,
+                                     long offset, long size, String chunkSha) throws IOException {
+        try (Socket nodeSock = connectSocket(target.host, target.port, DATA_TIMEOUT_MS)) {
+            OutputStream out = nodeSock.getOutputStream();
+            InputStream in = nodeSock.getInputStream();
+
+            Protocol.writeHeaderLine(out, String.format("PUT %s %d %s", chunkId, size, chunkSha));
+            Protocol.sendFileRange(localPath, offset, size, out);
+
+            String resp = Protocol.readHeaderLine(in);
+            if (resp == null) {
+                System.out.printf("[client] Nodul %s:%d a inchis conexiunea fara raspuns pentru %s.%n",
+                        target.host, target.port, chunkId);
+                return false;
+            }
+            if (!resp.startsWith("STORED ")) {
+                System.out.printf("[client] Nodul %s a respins bucata %s: %s%n", target.id, chunkId, resp);
+                return false;
+            }
+            String serverSha = resp.substring("STORED ".length()).trim();
+            if (!chunkSha.equalsIgnoreCase(serverSha)) {
+                System.out.printf("[client] Checksum diferit pentru bucata %s (%s vs %s).%n",
+                        chunkId, serverSha, chunkSha);
+                return false;
+            }
+            return true;
+        }
+    }
+
+    private void cleanupUploadedChunks(List<UploadedChunk> uploaded) {
+        for (UploadedChunk chunk : uploaded) {
+            try (Socket s = connectSocket(chunk.target.host, chunk.target.port, CONNECT_TIMEOUT_MS)) {
+                Protocol.writeHeaderLine(s.getOutputStream(), "REMOVE_REPLICA " + chunk.chunkId);
+                Protocol.readHeaderLine(s.getInputStream());
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -263,52 +440,183 @@ public class Client {
 
     private void downloadCoordinated(String nameOrId, String outDirArg) {
         try {
-            String locateResp;
+            String fileName;
+            long expectedSize;
+            String metaSha;
+            int chunkCount;
+            List<DownloadChunkPlan> chunks = new ArrayList<>();
+
             try (Socket coordSock = connectSocket(coordinatorHost, coordinatorPort, DATA_TIMEOUT_MS)) {
-                Protocol.writeHeaderLine(coordSock.getOutputStream(), "LOCATE " + nameOrId);
-                locateResp = Protocol.readHeaderLine(coordSock.getInputStream());
-            }
+                OutputStream coordOut = coordSock.getOutputStream();
+                InputStream coordIn = coordSock.getInputStream();
+                Protocol.writeHeaderLine(coordOut, "LOCATE " + nameOrId);
 
-            if (locateResp == null) {
-                System.out.println("[client] Eroare: coordonatorul a inchis conexiunea la LOCATE.");
-                return;
-            }
-            if ("NOT_FOUND".equals(locateResp) || locateResp.startsWith("ERROR ")) {
-                System.out.println(locateResp);
-                return;
-            }
-            if (!locateResp.startsWith("LOCATIONS ")) {
-                System.out.println("[client] Raspuns LOCATE invalid: " + locateResp);
-                return;
-            }
+                String locateResp = Protocol.readHeaderLine(coordIn);
+                if (locateResp == null) {
+                    System.out.println("[client] Eroare: coordonatorul a inchis conexiunea la LOCATE.");
+                    return;
+                }
+                if ("NOT_FOUND".equals(locateResp) || locateResp.startsWith("ERROR ")) {
+                    System.out.println(locateResp);
+                    return;
+                }
+                if (!locateResp.startsWith("LOCATIONS ")) {
+                    System.out.println("[client] Raspuns LOCATE invalid: " + locateResp);
+                    return;
+                }
 
-            // LOCATIONS <uuid> <name> <size> <sha256> <node1@host:port[,node2@host:port]>
-            String[] lp = locateResp.split("\\s+");
-            if (lp.length < 6) {
-                System.out.println("[client] Raspuns LOCATE incomplet: " + locateResp);
-                return;
-            }
-            String fileName = lp[2];
-            String metaSha = lp[4];
-            String[] endpoints = lp[5].split(",");
+                // LOCATIONS <uuid> <name> <size> <fullSha256> <chunkSize> <chunkCount>
+                String[] lp = locateResp.split("\\s+");
+                if (lp.length < 7) {
+                    System.out.println("[client] Raspuns LOCATE incomplet: " + locateResp);
+                    return;
+                }
+                fileName = Protocol.sanitizeFileName(lp[2]);
+                expectedSize = Long.parseLong(lp[3]);
+                metaSha = lp[4].trim().toLowerCase();
+                chunkCount = Integer.parseInt(lp[6]);
 
-            Path outDir = Paths.get(outDirArg);
-            for (String ep : endpoints) {
-                NodeTarget target = parseNodeEndpoint(ep);
-                try {
-                    if (downloadFromNode(target.host, target.port, fileName, outDir, metaSha)) {
+                for (int i = 0; i < chunkCount; i++) {
+                    String chunkLine = Protocol.readHeaderLine(coordIn);
+                    if (chunkLine == null) {
+                        System.out.println("[client] Eroare: raspuns LOCATIONS incomplet.");
                         return;
                     }
-                } catch (IOException e) {
-                    System.out.printf("[client] Nodul %s (%s:%d) indisponibil: %s%n",
-                            target.id, target.host, target.port, e.getMessage());
+                    String[] cp = chunkLine.trim().split("\\s+");
+                    if (cp.length < 7 || !"CHUNK".equalsIgnoreCase(cp[0])) {
+                        System.out.println("[client] Linie CHUNK invalida in LOCATIONS: " + chunkLine);
+                        return;
+                    }
+                    int idx = Integer.parseInt(cp[1]);
+                    String chunkId = cp[2];
+                    long offset = Long.parseLong(cp[3]);
+                    long chunkLen = Long.parseLong(cp[4]);
+                    String chunkSha = cp[5].trim().toLowerCase();
+                    String[] epRaw = cp[6].split(",");
+                    List<NodeTarget> targets = new ArrayList<>();
+                    for (String ep : epRaw) {
+                        if (!ep.trim().isEmpty()) {
+                            targets.add(parseNodeEndpoint(ep.trim()));
+                        }
+                    }
+                    chunks.add(new DownloadChunkPlan(idx, chunkId, offset, chunkLen, chunkSha, targets));
                 }
             }
-            System.out.println("[client] Nu s-a putut descarca fisierul de pe niciun nod.");
+
+            Path outDir = Paths.get(outDirArg);
+            Files.createDirectories(outDir);
+            Path finalTarget = outDir.resolve(fileName);
+            Path tmpTarget = outDir.resolve(fileName + ".part");
+
+            int workerCount = Math.min(Math.max(1, chunkCount), MAX_PARALLEL_CHUNKS);
+            ExecutorService pool = Executors.newFixedThreadPool(workerCount);
+            AtomicBoolean failed = new AtomicBoolean(false);
+            AtomicReference<String> errorMsg = new AtomicReference<>();
+
+            try (FileChannel channel = FileChannel.open(tmpTarget,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                List<Future<?>> futures = new ArrayList<>(chunks.size());
+                for (DownloadChunkPlan chunk : chunks) {
+                    futures.add(pool.submit(() -> {
+                        if (failed.get()) {
+                            return;
+                        }
+                        if (!downloadChunkWithFallback(chunk, channel)) {
+                            failed.set(true);
+                            errorMsg.compareAndSet(null,
+                                    "Nu s-a putut descarca valid bucata " + chunk.index + " (" + chunk.chunkId + ").");
+                        }
+                    }));
+                }
+
+                for (Future<?> f : futures) {
+                    try {
+                        f.get();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        failed.set(true);
+                        errorMsg.compareAndSet(null, "Descarcarea a fost intrerupta.");
+                    } catch (ExecutionException e) {
+                        failed.set(true);
+                        Throwable cause = e.getCause() != null ? e.getCause() : e;
+                        errorMsg.compareAndSet(null, cause.getMessage());
+                    }
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+
+            if (failed.get()) {
+                Files.deleteIfExists(tmpTarget);
+                System.out.println("[client] Descarcare esuata: "
+                        + (errorMsg.get() != null ? errorMsg.get() : "eroare necunoscuta"));
+                return;
+            }
+
+            long actualSize = Files.size(tmpTarget);
+            if (actualSize != expectedSize) {
+                Files.deleteIfExists(tmpTarget);
+                System.out.printf("[client] Eroare: dimensiune invalida pentru %s (%d vs %d octeti).%n",
+                        fileName, actualSize, expectedSize);
+                return;
+            }
+
+            String actualFullSha = ChecksumUtil.sha256(tmpTarget);
+            if (!actualFullSha.equalsIgnoreCase(metaSha)) {
+                Files.deleteIfExists(tmpTarget);
+                System.out.printf("[client] Eroare: checksum global invalid pentru %s (primit=%s, asteptat=%s).%n",
+                        fileName, actualFullSha, metaSha);
+                return;
+            }
+
+            Protocol.moveAtomically(tmpTarget, finalTarget);
+            System.out.printf("descarcat %s, checksum OK (%s, %d bucati)%n", finalTarget, actualFullSha, chunkCount);
+        } catch (IllegalArgumentException e) {
+            System.out.println("[client] " + e.getMessage());
         } catch (IOException e) {
             System.out.printf("[client] Eroare la interogarea coordonatorului (%s): %s%n",
                     coordinatorAddress, e.getMessage());
         }
+    }
+
+    private boolean downloadChunkWithFallback(DownloadChunkPlan chunk, FileChannel channel) {
+        for (NodeTarget target : chunk.targets) {
+            try (Socket nodeSock = connectSocket(target.host, target.port, DATA_TIMEOUT_MS)) {
+                OutputStream out = nodeSock.getOutputStream();
+                InputStream in = nodeSock.getInputStream();
+
+                Protocol.writeHeaderLine(out, "GET " + chunk.chunkId);
+                String header = Protocol.readHeaderLine(in);
+                if (header == null || "NOT_FOUND".equals(header) || header.startsWith("ERROR ")
+                        || !header.startsWith("FILE ")) {
+                    continue;
+                }
+
+                String[] fp = header.split("\\s+");
+                if (fp.length < 3) {
+                    continue;
+                }
+                long serverSize = Long.parseLong(fp[1]);
+                String serverSha = fp[2].trim().toLowerCase();
+                if (serverSize != chunk.size || !serverSha.equalsIgnoreCase(chunk.checksum)) {
+                    System.out.printf("[client] Antet invalid de pe %s pentru bucata %d.%n",
+                            target.id, chunk.index);
+                    continue;
+                }
+
+                String actualSha = Protocol.receiveBytesToChannel(in, chunk.size, channel, chunk.offset);
+                if (!actualSha.equalsIgnoreCase(chunk.checksum)) {
+                    System.out.printf("[client] Checksum invalid pentru bucata %d de pe %s (%s vs %s).%n",
+                            chunk.index, target.id, actualSha, chunk.checksum);
+                    continue;
+                }
+                return true;
+            } catch (IOException e) {
+                System.out.printf("[client] Nodul %s (%s:%d) indisponibil pentru bucata %d: %s%n",
+                        target.id, target.host, target.port, chunk.index, e.getMessage());
+            }
+        }
+        return false;
     }
 
     private void downloadDirect(String nodeArg, String remoteFileName, String outDirArg) {
@@ -399,27 +707,89 @@ public class Client {
                 return;
             }
 
-            System.out.println("========================================================================================================");
-            System.out.printf(" %-36s | %-20s | %-12s | %-14s | %s%n",
-                    "UUID", "NUME", "DIMENSIUNE", "SHA-256", "NODURI");
-            System.out.println("--------------------------------------------------------------------------------------------------------");
+            System.out.println("==========================================================================================================================");
+            System.out.printf(" %-36s | %-20s | %-12s | %-14s | %-14s | %s%n",
+                    "UUID", "NUME", "DIMENSIUNE", "CHUNKS", "SHA-256", "NODURI");
+            System.out.println("--------------------------------------------------------------------------------------------------------------------------");
             for (int i = 0; i < count; i++) {
                 String line = Protocol.readHeaderLine(in);
                 if (line == null) {
                     break;
                 }
                 String[] fp = line.trim().split("\\s+");
-                if (fp.length < 5) {
-                    continue;
+                if (fp.length >= 7) {
+                    String shaShort = fp[3].length() > 12 ? fp[3].substring(0, 12) + ".." : fp[3];
+                    long chunkSz = Long.parseLong(fp[5]);
+                    String chunkSummary = fp[4] + " (" + ChunkPolicy.formatHumanSize(chunkSz) + ")";
+                    System.out.printf(" %-36s | %-20s | %10s B | %-14s | %-14s | %s%n",
+                            fp[0], fp[1], fp[2], chunkSummary, shaShort, fp[6]);
+                } else if (fp.length >= 5) {
+                    String shaShort = fp[3].length() > 12 ? fp[3].substring(0, 12) + ".." : fp[3];
+                    System.out.printf(" %-36s | %-20s | %10s B | %-14s | %-14s | %s%n",
+                            fp[0], fp[1], fp[2], "1 (-)", shaShort, fp[4]);
                 }
-                String shaShort = fp[3].length() > 12 ? fp[3].substring(0, 12) + ".." : fp[3];
-                System.out.printf(" %-36s | %-20s | %10s B | %-14s | %s%n",
-                        fp[0], fp[1], fp[2], shaShort, fp[4]);
             }
-            System.out.println("========================================================================================================");
+            System.out.println("==========================================================================================================================");
         } catch (IOException e) {
             System.out.printf("[client] Eroare la listarea fisierelor (%s): %s%n",
                     coordinatorAddress, e.getMessage());
+        }
+    }
+
+    private void showFileInfo(String nameOrId) {
+        try (Socket socket = connectSocket(coordinatorHost, coordinatorPort, CONNECT_TIMEOUT_MS)) {
+            Protocol.writeHeaderLine(socket.getOutputStream(), "LOCATE " + nameOrId);
+            InputStream in = socket.getInputStream();
+            String header = Protocol.readHeaderLine(in);
+            if (header == null) {
+                System.out.println("[client] Coordonatorul a inchis conexiunea la info.");
+                return;
+            }
+            if ("NOT_FOUND".equals(header) || header.startsWith("ERROR ")) {
+                System.out.println(header);
+                return;
+            }
+            if (!header.startsWith("LOCATIONS ")) {
+                System.out.println("[client] Raspuns invalid la info: " + header);
+                return;
+            }
+
+            // LOCATIONS <uuid> <name> <size> <fullSha256> <chunkSize> <chunkCount>
+            String[] lp = header.split("\\s+");
+            if (lp.length < 7) {
+                System.out.println("[client] Raspuns LOCATE incomplet: " + header);
+                return;
+            }
+            long fileSize = Long.parseLong(lp[3]);
+            long chunkSize = Long.parseLong(lp[5]);
+            int chunkCount = Integer.parseInt(lp[6]);
+
+            System.out.println("==============================================================================================================");
+            System.out.printf(" Fisier: %s (UUID: %s)%n", lp[2], lp[1]);
+            System.out.printf(" Dimensiune: %d octeti (%s) | Bucati: %d (chunk max: %s) | SHA-256: %s%n",
+                    fileSize, ChunkPolicy.formatHumanSize(fileSize), chunkCount,
+                    ChunkPolicy.formatHumanSize(chunkSize), lp[4]);
+            System.out.println("--------------------------------------------------------------------------------------------------------------");
+            System.out.printf(" %-3s | %-44s | %-12s | %-12s | %-14s | %s%n",
+                    "#", "CHUNK ID", "OFFSET", "DIMENSIUNE", "SHA-256", "NODURI");
+            System.out.println("--------------------------------------------------------------------------------------------------------------");
+            for (int i = 0; i < chunkCount; i++) {
+                String line = Protocol.readHeaderLine(in);
+                if (line == null) {
+                    break;
+                }
+                String[] cp = line.trim().split("\\s+");
+                if (cp.length < 7) {
+                    continue;
+                }
+                String shaShort = cp[5].length() > 12 ? cp[5].substring(0, 12) + ".." : cp[5];
+                System.out.printf(" %-3s | %-44s | %12s | %10s B | %-14s | %s%n",
+                        cp[1], cp[2], cp[3], cp[4], shaShort, cp[6]);
+            }
+            System.out.println("==============================================================================================================");
+        } catch (IOException e) {
+            System.out.printf("[client] Eroare la interogarea info '%s' (%s): %s%n",
+                    nameOrId, coordinatorAddress, e.getMessage());
         }
     }
 
@@ -662,12 +1032,13 @@ public class Client {
 
     private void printHelp() {
         System.out.println("Comenzi disponibile:");
-        System.out.println("  put <fisier_local>                           - incarcare prin coordonator (ALLOCATE -> PUT -> COMMIT)");
+        System.out.println("  put <fisier_local>                           - incarcare distribuita pe bucati (ALLOCATE -> PUT paralel -> COMMIT)");
         System.out.println("  put <nod|host:port> <fisier_local>           - incarcare directa pe un nod (ex: put localhost:7002 test.bin)");
-        System.out.println("  get <nume_sau_id> [dir_dest]                 - descarcare prin coordonator (LOCATE -> GET + SHA-256)");
+        System.out.println("  get <nume_sau_id> [dir_dest]                 - descarcare paralela (LOCATE -> GET paralel + SHA-256)");
         System.out.println("  get <nod|host:port> <nume> [dir_dest]        - descarcare directa de pe un nod");
         System.out.println("  ls                                           - listeaza fisierele inregistrate pe coordonator");
-        System.out.println("  rm <nume_sau_id>                             - sterge fisierul din metadate si de pe nod");
+        System.out.println("  info <nume_sau_id>                           - afiseaza distributia pe bucati si noduri pentru un fisier");
+        System.out.println("  rm <nume_sau_id>                             - sterge fisierul din metadate si toate bucatile de pe noduri");
         System.out.println("  nodes                                        - afiseaza starea nodurilor din cluster");
         System.out.println("  freeze <port> / unfreeze <port>              - opreste/reia heartbeat-ul unui nod pentru test");
         System.out.println("  exit                                         - inchide clientul");
@@ -717,6 +1088,51 @@ public class Client {
         System.err.println("Utilizare interactiva: java -cp target/classes ro.ubm.sd.client.Client --coordinator <host:port>");
         System.err.println("Utilizare directa:     java -cp target/classes ro.ubm.sd.client.Client [--coordinator <host:port>] <comanda> [args]");
         System.exit(1);
+    }
+
+    private static final class UploadChunkPlan {
+        final int index;
+        final String chunkId;
+        final long offset;
+        final long size;
+        final NodeTarget target;
+
+        UploadChunkPlan(int index, String chunkId, long offset, long size, NodeTarget target) {
+            this.index = index;
+            this.chunkId = chunkId;
+            this.offset = offset;
+            this.size = size;
+            this.target = target;
+        }
+    }
+
+    private static final class UploadedChunk {
+        final String chunkId;
+        final NodeTarget target;
+
+        UploadedChunk(String chunkId, NodeTarget target) {
+            this.chunkId = chunkId;
+            this.target = target;
+        }
+    }
+
+    private static final class DownloadChunkPlan {
+        final int index;
+        final String chunkId;
+        final long offset;
+        final long size;
+        final String checksum;
+        final List<NodeTarget> targets;
+
+        DownloadChunkPlan(int index, String chunkId, long offset, long size,
+                          String checksum, List<NodeTarget> targets) {
+            this.index = index;
+            this.chunkId = chunkId;
+            this.offset = offset;
+            this.size = size;
+            this.checksum = checksum;
+            this.targets = targets;
+        }
     }
 
     private static final class NodeTarget {
